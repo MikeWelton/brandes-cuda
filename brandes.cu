@@ -1,11 +1,13 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <cmath>
 #include "errors.h"
 #include "brandes_cpu.cu"
 
 
 #define MDEG ((int) 4)  // Use same value as suggested in paper
+#define BLOCKS 1
 #define THREADS 1024
 
 
@@ -211,7 +213,7 @@ __global__ void brandesCuda(Graph *graph, double *centrality, double *delta, int
             __syncthreads();  // Sync for l and arrays
         }
 
-        for (v = 0; v < graph->numVertices; ++v) {
+        for (v = (int) threadIdx.x; v < graph->numVertices; v += (int) blockDim.x) {
             if (sigma[v] != 0) {
                 delta[v] = 1 / (double) sigma[v];
             }
@@ -320,16 +322,20 @@ double *runBrandesCuda(int numVertices, int numEdges, int **edges) {
     cudaCheck(cudaEventCreate(&stop));
     cudaCheck(cudaEventRecord(start, nullptr));
 
-    brandesCuda<<<1, THREADS>>>(deviceGraph, deviceCentrality, delta, d, sigma);
+    brandesCuda<<<BLOCKS, THREADS>>>(deviceGraph, deviceCentrality, delta, d, sigma);
     cudaCheck(cudaDeviceSynchronize());
 
     // Record elapsed time and destroy events
     cudaCheck(cudaEventRecord(stop, nullptr));
     cudaCheck(cudaEventSynchronize(stop));
 
-    float elapsedTime;
-    cudaCheck(cudaEventElapsedTime(&elapsedTime, start, stop));
-    printf("Elapsed time: %3.1f ms\n", elapsedTime);
+    float timeMilis, timeSeconds, timeMinutes, timeMinutesRemSeconds;
+    cudaCheck(cudaEventElapsedTime(&timeMilis, start, stop));
+    timeSeconds = timeMilis / 1000;
+    timeMinutesRemSeconds = (float) fmod(timeSeconds, 60);
+    timeMinutes = (timeSeconds - timeMinutesRemSeconds) / 60;
+    printf("Elapsed time: %3.1f ms | %.1f s | %.1f min %.1f s\n",
+           timeMilis, timeSeconds, timeMinutes, timeMinutesRemSeconds);
 
     cudaCheck(cudaEventDestroy(start));
     cudaCheck(cudaEventDestroy(stop));
@@ -361,7 +367,7 @@ int main(int argc, char **argv) {
 
     double *centrality = runBrandesCuda(numVertices, numEdges, edges);
 
-    printArray(centrality, numVertices);
+    // printArray(centrality, numVertices); // TODO remove later
     writeOutputToFile(outputFile, centrality, numVertices);
 
     free(centrality);

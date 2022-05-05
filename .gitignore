@@ -1,5 +1,6 @@
 .idea
 cmake-build-debug
+brandes-verify
 a.txt
 brandes
 CMakeLists.txt
