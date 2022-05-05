@@ -15,7 +15,7 @@ int **createNeighborsLists(
     vector<vector<int>> neighbors(numVertices);
 
     for (int i = 0; i < numEdges; ++i) {
-        // Add neighbor for both nodes.
+        // Add neighbor for both nodes
         neighbors[edges[0][i]].push_back(edges[1][i]);
         neighbors[edges[1][i]].push_back(edges[0][i]);
     }
@@ -83,14 +83,12 @@ double *brandesCpu(int numVertices, int **neighbors, const int *numNeighbors) {
             }
         }
 
-        // S returns vertices in order of non-increasing distance from s
         while (!stack.empty()) {
             w = stack.top();
             stack.pop();
 
             for (auto v: p[w]) {
                 delta[v] += delta[w];
-                // delta[v] += ((double) sigma[v] / (double) sigma[w]) * (1 + delta[w]);
             }
         }
 
