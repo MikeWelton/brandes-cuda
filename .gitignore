@@ -4,3 +4,5 @@ brandes-verify
 a.txt
 brandes
 CMakeLists.txt
+temp.*
+tmp.*

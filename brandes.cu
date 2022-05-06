@@ -68,7 +68,6 @@ int main(int argc, char **argv) {
 
     double *centrality = runBrandesCuda(numVertices, numEdges, edges);
 
-    // printArray(centrality, numVertices); // TODO remove later
     writeOutputToFile(outputFile, centrality, numVertices);
 
     free(centrality);

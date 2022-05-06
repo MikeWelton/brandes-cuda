@@ -1,12 +1,15 @@
 #include "errors.h"
+#include "timer_cuda.h"
 #include "graph.cu"
 
 
-#define BLOCKS 128
+#define BLOCKS 512
 #define THREADS 1024
 
 
-__global__ void brandesCudaSingleBlock(Graph *graph, double *centrality, double *delta, int *d, int *sigma) {
+// This kernel works only when run with single cuda block.
+__global__ void brandesCudaSingleBlock(Graph *graph, double *centrality, double *delta, int *d,
+                                       int *sigma) {
     if (threadIdx.x >= max(graph->numVertices, graph->vmapSize)) {
         return;
     }
@@ -115,39 +118,8 @@ __global__ void brandesCudaSingleBlock(Graph *graph, double *centrality, double 
     }
 }
 
-Graph *copyGraphToCuda(Graph *graph, vector<int*> &devGraphArrays) {
-    Graph *deviceGraph;
 
-    // Allocate and copy graph object to cuda
-    cudaCheck(cudaMalloc((void **) &deviceGraph, sizeof(Graph)));
-    cudaCheck(cudaMemcpy(deviceGraph, graph, sizeof(Graph), cudaMemcpyHostToDevice));
-
-    // Copy arrays that graph stores pointers to
-    int *vmap, *vptrs, *adjs;
-    cudaCheck(cudaMalloc((void **) &vmap, sizeof(int) * graph->vmapSize));
-    cudaCheck(cudaMemcpy(vmap, graph->vmap, sizeof(int) * graph->vmapSize, cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(&(deviceGraph->vmap), &vmap, sizeof(int *), cudaMemcpyHostToDevice));
-
-    cudaCheck(cudaMalloc((void **) &vptrs, sizeof(int) * graph->vptrsSize));
-    cudaCheck(cudaMemcpy(vptrs, graph->vptrs, sizeof(int) * graph->vptrsSize, cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(&(deviceGraph->vptrs), &vptrs, sizeof(int *), cudaMemcpyHostToDevice));
-
-    cudaCheck(cudaMalloc((void **) &adjs, sizeof(int) * graph->adjsSize));
-    cudaCheck(cudaMemcpy(adjs, graph->adjs, sizeof(int) * graph->adjsSize, cudaMemcpyHostToDevice));
-    cudaCheck(cudaMemcpy(&(deviceGraph->adjs), &adjs, sizeof(int *), cudaMemcpyHostToDevice));
-
-    devGraphArrays = {vmap, vptrs, adjs};
-
-    return deviceGraph;
-}
-
-void freeGraphFromCuda(Graph *deviceGraph, vector<int *> &devGraphArrays) {
-    for (auto arrPtr: devGraphArrays) {
-        cudaCheck(cudaFree(arrPtr));
-    }
-    cudaCheck(cudaFree(deviceGraph));
-}
-
+// Code for brandes algorithm run with multiple cuda blocks.
 __constant__ int NUM_THREADS = BLOCKS * THREADS;
 __device__ bool devCont;
 
@@ -231,96 +203,145 @@ __global__ void updateCentrality(Graph *graph, int *sigma, double *centrality, d
     }
 }
 
-void runKernels(Graph *graph, Graph *deviceGraph, int *d, int *sigma, double *deviceCentrality, double *delta) {
+
+static TimerCuda timer;
+
+// Returns cumulative execution time of all kernels.
+pair<float, float> brandesCudaMultipleBlocks(Graph *graph, Graph *deviceGraph, int *d, int *sigma,
+                                             double *deviceCentrality, double *delta) {
     int s = 0, l;
     bool cont;
+    float kernelsTime = 0.0, memoryTime = 0.0;
 
     while (s < graph->numVertices) {
         l = 0;
         cont = true;
 
         // Init arrays in parallel
+        timer.start();
         initArrays<<<BLOCKS, THREADS>>>(deviceGraph, d, sigma, s);
+        kernelsTime += timer.stop();
 
         // Forward pass
         while (cont) {
             cont = false;
 
             // Forward step in parallel
+            timer.start();
             cudaCheck(cudaMemcpyToSymbol(devCont, &cont, sizeof(bool)));
+            memoryTime += timer.stop();
+
+            timer.start();
             forwardStep<<<BLOCKS, THREADS>>>(deviceGraph, d, sigma, l);
+            kernelsTime += timer.stop();
+
+            timer.start();
             cudaCheck(cudaMemcpyFromSymbol((void *) &cont, devCont, sizeof(bool)));
+            memoryTime += timer.stop();
 
             ++l;
         }
 
+        // Init delta values
+        timer.start();
         initDelta<<<BLOCKS, THREADS>>>(deviceGraph, sigma, delta);
+        kernelsTime += timer.stop();
 
         // Backward pass
         while (l > 1) {
             --l;
 
             // Backward step in parallel
+            timer.start();
             backwardStep<<<BLOCKS, THREADS>>>(deviceGraph, d, delta, l);
+            kernelsTime += timer.stop();
         }
 
         // Update centrality values
+        timer.start();
         updateCentrality<<<BLOCKS, THREADS>>>(deviceGraph, sigma, deviceCentrality, delta, s);
+        kernelsTime += timer.stop();
+
         ++s;
     }
+
+    return {kernelsTime, memoryTime};
+}
+
+Graph *copyGraphToCuda(Graph *graph, vector<int*> &devGraphArrays) {
+    Graph *deviceGraph;
+
+    // Allocate and copy graph object to cuda
+    cudaCheck(cudaMalloc((void **) &deviceGraph, sizeof(Graph)));
+    cudaCheck(cudaMemcpy(deviceGraph, graph, sizeof(Graph), cudaMemcpyHostToDevice));
+
+    // Copy arrays that graph stores pointers to
+    int *vmap, *vptrs, *adjs;
+    cudaCheck(cudaMalloc((void **) &vmap, sizeof(int) * graph->vmapSize));
+    cudaCheck(cudaMemcpy(vmap, graph->vmap, sizeof(int) * graph->vmapSize, cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(&(deviceGraph->vmap), &vmap, sizeof(int *), cudaMemcpyHostToDevice));
+
+    cudaCheck(cudaMalloc((void **) &vptrs, sizeof(int) * graph->vptrsSize));
+    cudaCheck(cudaMemcpy(vptrs, graph->vptrs, sizeof(int) * graph->vptrsSize, cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(&(deviceGraph->vptrs), &vptrs, sizeof(int *), cudaMemcpyHostToDevice));
+
+    cudaCheck(cudaMalloc((void **) &adjs, sizeof(int) * graph->adjsSize));
+    cudaCheck(cudaMemcpy(adjs, graph->adjs, sizeof(int) * graph->adjsSize, cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(&(deviceGraph->adjs), &adjs, sizeof(int *), cudaMemcpyHostToDevice));
+
+    devGraphArrays = {vmap, vptrs, adjs};
+
+    return deviceGraph;
+}
+
+void freeGraphFromCuda(Graph *deviceGraph, vector<int *> &devGraphArrays) {
+    for (auto arrPtr: devGraphArrays) {
+        cudaCheck(cudaFree(arrPtr));
+    }
+    cudaCheck(cudaFree(deviceGraph));
 }
 
 double *runBrandesCuda(int numVertices, int numEdges, int **edges) {
-    // Pointers to arrays stored in graph that should be freed from cuda
+    // Pointers to arrays stored in graph that should be freed from cuda (vmap, vptrs, adjs)
     vector<int *> devGraphArrays;
-    // Create graph and copy it to device
     Graph graph = Graph(numVertices, numEdges, edges);
-    Graph *deviceGraph = copyGraphToCuda(&graph, devGraphArrays);
-
-    // Create all necessary arrays, allocate them and copy centrality to device
+    Graph *deviceGraph;
+    // All arrays that are needed for algorithm
     int *d, *sigma;
     double *centrality = (double *) calloc(graph.numVertices, sizeof(double)),
            *deviceCentrality, *delta;
+
+    float kernelsTime, memoryTime = 0.0;
+
+    timer.start();
+    deviceGraph = copyGraphToCuda(&graph, devGraphArrays);
 
     cudaCheck(cudaMalloc((void **)&sigma, sizeof(int) * graph.numVertices));
     cudaCheck(cudaMalloc((void **)&d, sizeof(int) * graph.numVertices));
     cudaCheck(cudaMalloc((void **)&deviceCentrality, sizeof(double) * graph.numVertices));
     cudaCheck(cudaMalloc((void **)&delta, sizeof(double) * graph.numVertices));
     cudaCheck(cudaMemcpy(deviceCentrality, centrality, sizeof(double) * graph.numVertices, cudaMemcpyHostToDevice));
+    memoryTime += timer.stop();
 
-    // Timer
-    cudaEvent_t start, stop;
-    cudaCheck(cudaEventCreate(&start));
-    cudaCheck(cudaEventCreate(&stop));
-    cudaCheck(cudaEventRecord(start, nullptr));
+    pair<float, float> algoTimes = brandesCudaMultipleBlocks(&graph, deviceGraph, d, sigma, deviceCentrality, delta);
+    kernelsTime = algoTimes.first;
+    memoryTime += algoTimes.second;
 
-    runKernels(&graph, deviceGraph, d, sigma, deviceCentrality, delta);
     // brandesCudaSingleBlock<<<1, THREADS>>>(deviceGraph, deviceCentrality, delta, d, sigma);
 
-    // Record elapsed time and destroy events
-    cudaCheck(cudaEventRecord(stop, nullptr));
-    cudaCheck(cudaEventSynchronize(stop));
-
-    float timeMilis, timeSeconds, timeMinutes, timeMinutesRemSeconds;
-    cudaCheck(cudaEventElapsedTime(&timeMilis, start, stop));
-    timeSeconds = timeMilis / 1000;
-    timeMinutesRemSeconds = (float) fmod(timeSeconds, 60);
-    timeMinutes = (timeSeconds - timeMinutesRemSeconds) / 60;
-    printf("Elapsed time: %3.1f ms | %.1f s | %.0f min %.1f s\n",
-           timeMilis, timeSeconds, timeMinutes, timeMinutesRemSeconds);
-
-    cudaCheck(cudaEventDestroy(start));
-    cudaCheck(cudaEventDestroy(stop));
-
-    // Copy centrality and clean memory
+    timer.start();
     cudaCheck(cudaMemcpy(centrality, deviceCentrality, sizeof(double) * graph.numVertices, cudaMemcpyDeviceToHost));
+    memoryTime += timer.stop();
+
+    // Clean memory
     freeGraphFromCuda(deviceGraph, devGraphArrays);
     cudaCheck(cudaFree(sigma));
     cudaCheck(cudaFree(d));
     cudaCheck(cudaFree(deviceCentrality));
     cudaCheck(cudaFree(delta));
 
-    cudaDeviceReset();  // TODO For cuda-memcheck
+    cerr << (int) kernelsTime << '\n'
+         << (int) (kernelsTime + memoryTime) << '\n';
 
     return centrality;
 }
